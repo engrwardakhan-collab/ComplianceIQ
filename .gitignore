@@ -76,3 +76,7 @@ temp/
 
 # Vercel
 .vercel/
+
+# Legacy setup files
+SETUP_INSTRUCTIONS.txt
+START_HERE.md
