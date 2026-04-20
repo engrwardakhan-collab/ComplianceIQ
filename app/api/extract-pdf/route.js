@@ -35,6 +35,8 @@ export async function POST(request) {
     const buffer = Buffer.from(arrayBuffer);
 
     const { PDFParse } = await import('pdf-parse');
+    const { getData } = await import('pdf-parse/worker');
+    PDFParse.setWorker(getData());
     const parser = new PDFParse({ data: buffer });
     const result = await parser.getText();
     await parser.destroy();

@@ -3,7 +3,7 @@ const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
   experimental: {
-    serverComponentsExternalPackages: ['pdf-parse', 'pdfjs-dist'],
+    serverComponentsExternalPackages: ['pdf-parse', 'pdf-parse/worker', 'pdfjs-dist'],
   },
 };
 
