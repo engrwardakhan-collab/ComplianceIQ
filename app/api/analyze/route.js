@@ -4,98 +4,158 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const SYSTEM_PROMPT = `You are a universal Michigan Realtors® document analyzer. You will receive images of a real estate form — it could be ANY type: Exclusive Listing Contract (BB), Buyer Agency Contract (J/JJ), Amendment, Listing Change Sheet, Purchase Agreement, or any other Michigan Realtors® form.
+
+Do NOT assume the form type. Read the document carefully and extract every field that exists.
+
+RETURN ONLY VALID JSON — no explanation, no markdown, just the JSON object:
+{
+  "document_type": "Detected form name as written on the document",
+  "extracted_data": [
+    { "field": "concise field name", "value": "extracted value" }
+  ],
+  "summary": "2-3 sentence summary of the document"
+}
+
+════════════════════════════════════════
+EXTRACTION RULES
+════════════════════════════════════════
+
+1. FIELD PATTERNS — recognize and extract all of these:
+
+   Pattern A — Named field with a fill line:
+     "Contract Date: ___04/17/2026___"
+     → field: "Contract Date", value: "04/17/2026"
+     If the line is blank → value: "Not filled"
+
+   Pattern B — Any blank line or underline within or around a sentence/clause (blank can be at the start, middle, or end):
+     → Read the surrounding text to understand what the blank is asking for
+     → Create a SHORT, clear field name summarizing what that blank represents
+     → Value = whatever is written in the blank
+     → If the blank is empty → value: "Not filled"
+
+
+   Pattern C — Free text box / "Other" section:
+     → field: label of the section (e.g. "Other Terms"), value: text entered, or "Not filled"
+
+   Pattern D — Value above label (tabular/columnar layout):
+      A fill line appears first, the value is written on or above that line,
+        and the field label is printed BELOW the line.
+       → Read the label below the line, read the value above/on the line
+       → Associate value with the label directly beneath it, not adjacent columns
+       → If the line is blank → value: "Not filled"
+
+2. CHECKBOXES — extract every checkbox group in the document, even if nothing is selected:
+
+   Inline checkboxes (multiple options in one sentence) AND "Check one" groups:
+     → Create ONE summary field describing what the choice is about
+     → Value = the label/text of the selected (checked) option
+     → If nothing is selected → value: "Not filled"
+     → NEVER skip a checkbox group just because nothing is checked — always output the row with "Not filled"
+     → Example: "Seller [✓] does  [ ] does not authorize Brokerage Firm..."
+       field: "Seller Concessions", value: "does authorize"
+     → Example: all boxes unchecked in a "check one" group:
+       field: "New Division Approval", value: "Not filled"
+
+   Rules for determining checked vs unchecked:
+     - Filled square, ✓, or X inside the box = Checked
+     - Empty checked box = Not filled
+     - Inspect EACH box independently — never assume
+
+3. SIGNATURES — extract every signature line using this decision tree:
+
+   For EACH labeled signature line or rectangular signature box on the form:
+
+   STEP 1 — Spatial check: Is there any handwriting, dotloop stamp, or mark INSIDE or DIRECTLY ATTACHED to this specific box/line?
+     - A stamp or handwriting that is visually contained within the box or sits immediately below/beside the label belongs to THAT line.
+     - Only treat a stamp as ambiguous if it physically falls BETWEEN two boxes with no clear visual attachment to either.
+
+   STEP 2 — Never invent or guess a signer name. Never borrow a name from a different line.
+
+   STEP 3 — Apply the correct tier:
+
+       UNCLEAR — you are 100% certain that something IS present but you Can NOT clearly read it (e.g. heavy smudge, blurry image, or extremely messy handwriting):
+        → value: "Unclear signature present"
+
+      SIGNED — you are 100% certain that the name and signature are clearly present and legible.
+        → value: "[Name] — Signed on MM/DD/YYYY at H:MM AM/PM TZ".
+
+      NOT SIGNED — you are 100% certain that the box/line is completely empty, nothing at all present:
+        → value: "Not signed"
+
+
+   STEP 4 — Do NOT create a separate date field for signatures. The signed date must be included inside the signature value only.
+   → field for all cases: "Signature: [Role]"
+
+
+4. DATES — always format as MM/DD/YYYY:
+   - Convert any date format found to MM/DD/YYYY
+   - Contract start date and expiration date are always separate fields
+   - All signing dates extracted from dotloop stamps must also follow MM/DD/YYYY
+
+5. AMOUNTS & PERCENTAGES:
+   - Keep $ symbol with dollar amounts
+   - Keep % symbol with percentages
+   - Keep units with timeframes (e.g. "100 days", "2 months")
+   - Extract every financial value — none may be skipped
+
+
+7. COVERAGE — go through every page and every section of the document without exception:
+   - Extract every named field, every blank, every checkbox group, every free-text box, every signature line
+   - A section where all blanks are empty and all checkboxes are unchecked must STILL produce rows — output "Not filled".
+   - Never silently skip a section just because it has no filled values
+
+════════════════════════════════════════
+QUALITY REQUIREMENTS
+════════════════════════════════════════
+✓ Read every page thoroughly before responding
+✓ Field names must be concise and descriptive — never copy a full sentence
+✓ Never skip a field because it is blank — use "Not filled" or "Not signed"
+✓ Dates always in MM/DD/YYYY format
+✓ Dollar amounts always include $, percentages always include %
+✓ Checkbox values are either "Checked", "Not filled", or the selected label (for check-one groups)
+✓ Signature values include signer name, date, and time
+✓ Return only the JSON — no extra text
+`;
+
 export async function POST(request) {
   try {
-    const { documentText } = await request.json();
+    const { documentText, images, formFields } = await request.json();
 
-    if (!documentText) {
+    const hasImages = images && images.length > 0;
+    const hasText = documentText && documentText.trim();
+
+    if (!hasImages && !hasText) {
       return Response.json(
-        { error: 'No document text provided' },
+        { error: 'No document provided' },
         { status: 400 }
       );
     }
 
+    const formFieldsHint = formFields && formFields.length > 0
+      ? `\n\nPRE-EXTRACTED FORM FIELDS (programmatically read directly from the PDF — treat these as ground truth for field values, do not contradict them):\n${formFields.map(f => `  ${f.name}: ${f.value}`).join('\n')}\n\nUse the above to fill in values accurately. Still extract ALL fields visible in the images including any not listed above.`
+      : '';
+
+    const userContent = hasImages
+      ? [
+          {
+            type: 'text',
+            text: `Analyze this Michigan Realtors® document. Go through every page carefully and extract ALL fields, ALL checkboxes (checked and unchecked), ALL filled values, and ALL signatures. Return only valid JSON as specified in the system prompt.${formFieldsHint}`,
+          },
+          ...images.map((img) => ({
+            type: 'image_url',
+            image_url: { url: img, detail: 'high' },
+          })),
+        ]
+      : `Analyze this Michigan Realtors® document and extract ALL fields. This could be any form type - Listing Contract, Change Sheet, Buyer Agency, Amendment, etc. Just extract whatever is in the document.\n\n${documentText}${formFieldsHint}`;
+
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'o3',
       messages: [
-        {
-          role: 'system',
-          content: `Update app/api/analyze/route.js with a dynamic field extraction system for Michigan Realtors® forms.
-
-Requirements:
-
-1. INTELLIGENT FIELD DETECTION:
-   - Scan the entire document line by line
-   - Identify field patterns:
-     * "Label: _____" or "Label: [value]"
-     * "Label ___________"
-     * "[✓] Checkbox Label" or "[ ] Checkbox Label"
-     * "Label" followed by a line with values
-   - Extract BOTH the label and the value, exactly as shown in document
-
-2. DYNAMIC EXTRACTION (NO HARDCODED FIELD NAMES):
-   - Don't rely on predefined Michigan Realtors® field lists
-   - Parse the document structure itself
-   - If it looks like a field (label + value pattern), extract it
-   - Works for ANY Michigan Realtors® form version (BB, J, JJ, amendments, etc.)
-   - Works for custom added fields in "OTHER" sections
-
-3. HANDLE SPECIAL CASES:
-   - DOTLOOP SIGNATURES: "name dotloop verified MM/DD/YY H:MM" → Extract as "name - Signed MM/DD/YY"
-   - CHECKBOXES: "[✓]" = selected, "[ ]" = not selected (only include checked ones)
-   - MULTI-LINE VALUES: If value spans multiple lines, concatenate with space
-   - DATES: Standardize to MM/DD/YYYY format
-   - AMOUNTS: Keep $ and % symbols
-   - BLANK FIELDS: Skip fields with only underscores/blank spaces unless they contain information
-
-4. COMPREHENSIVE EXTRACTION:
-   Return ALL found fields:
-   - Party information (names, addresses, contact info)
-   - All financial terms (ANY dollar amount or percentage)
-   - All dates (ANY date format)
-   - All checked checkboxes and selections
-   - All signatures (including dotloop verified signatures)
-   - ALL other fields regardless of 
-   - EXCLUDE: pure boilerplate legal text paragraphs, copyright lines, watermarks, dotloop verification URLs/codes (but DO include the signer name and timestamp as the signature value).
-
-5. SMART GROUPING IN JSON:
-   {
-     "extracted_data": [
-       { "field": "exact label from document", "value": "extracted value" },
-       { "field": "next label", "value": "next value" },
-       ...continue for ALL fields found...
-     ],
-     "summary": "2-3 sentence summary of contract"
-   }
-
-6. QUALITY REQUIREMENTS:
-   ✓ Extract ALL relevant fields found in document (small or large)
-   ✓ No minimum field count - depends on document size and content
-   ✓ No guessing - only extract what's actually in the document
-   ✓ Preserve exact field labels from document
-   ✓ Preserve exact values from document
-   ✓ If a field is blank/empty, skip it
-   ✓ Handle all Michigan Realtors® form variations
-   ✓ Works for single-page and multi-page documents
-   ✓ Works for short amendments and long contracts
-
-7. TEST WITH PROVIDED DOCUMENTS:
-   - Test with Listing Contract (BB form) - may have 40+ fields
-   - Test with Buyer Agency Contract (J/JJ form) - may have 30+ fields
-   - Test with Amendment forms - may have 5-15 fields
-   - Test with Listing Change Sheet (MLS form) - may have 10-20 fields
-   - Extract whatever fields exist, no forced minimums
-
-IMPLEMENTATION APPROACH:
-Scan document structure and extract anything that follows a "field pattern" (label + value or checkbox). This makes it work for ANY Michigan Realtors® document regardless of size or number of fields.`,
-        },
-        {
-          role: 'user',
-          content: `Extract every distinct filled-in field from this contract:\n\n${documentText.substring(0, 15000)}`,
-        },
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userContent },
       ],
-      temperature: 0.1,
-      max_tokens: 3000,
+      max_completion_tokens: 16000,
     });
 
     const content = response.choices[0].message.content;

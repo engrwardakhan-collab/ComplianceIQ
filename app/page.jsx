@@ -12,18 +12,88 @@ async function extractTextFromPDF(file) {
   try {
     response = await fetch('/api/extract-pdf', { method: 'POST', body: formData });
   } catch {
-    throw new Error('Could not reach the PDF extraction service. Check your connection.');
+    return '';
   }
 
   const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) {
-    throw new Error('PDF extraction service returned an unexpected response. Try uploading a .txt file instead.');
-  }
+  if (!contentType.includes('application/json')) return '';
 
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'PDF extraction failed');
-  if (!data.text?.trim()) throw new Error('No readable text found in this PDF. It may be scanned — try a text-based PDF or .txt file.');
-  return data.text;
+  if (!response.ok) return '';
+  return data.text || '';
+}
+
+async function loadPDFJS() {
+  if (typeof window === 'undefined') return null;
+  if (window.pdfjsLib) return window.pdfjsLib;
+
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    script.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      resolve(window.pdfjsLib);
+    };
+    script.onerror = () => reject(new Error('Failed to load PDF.js from CDN'));
+    document.head.appendChild(script);
+  });
+}
+
+async function extractFormFields(file) {
+  if (typeof window === 'undefined') return [];
+  const pdfjsLib = await loadPDFJS();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+
+  const fields = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const annotations = await page.getAnnotations();
+    for (const annot of annotations) {
+      if (annot.subtype !== 'Widget') continue;
+      const name = annot.fieldName || annot.alternativeText || '';
+      if (!name) continue;
+      let value = 'Not filled';
+      if (annot.fieldType === 'Tx') {
+        value = annot.fieldValue ? String(annot.fieldValue).trim() : 'Not filled';
+      } else if (annot.fieldType === 'Btn') {
+        if (annot.checkBox) {
+          value = annot.fieldValue && annot.fieldValue !== 'Off' ? 'Checked' : 'Unchecked';
+        } else {
+          value = annot.fieldValue ? String(annot.fieldValue).trim() : 'Not filled';
+        }
+      } else if (annot.fieldType === 'Ch') {
+        value = annot.fieldValue ? String(annot.fieldValue).trim() : 'Not filled';
+      }
+      fields.push({ name, value });
+    }
+  }
+  return fields;
+}
+
+async function renderPDFToImages(file) {
+  if (typeof window === 'undefined') return [];
+
+  const pdfjsLib = await loadPDFJS();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+
+  const images = [];
+  const numPages = Math.min(pdf.numPages, 15);
+
+  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 3.0 });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    images.push(canvas.toDataURL('image/jpeg', 0.92));
+  }
+
+  return images;
 }
 
 export default function Home() {
@@ -73,19 +143,30 @@ export default function Home() {
       if (file.type === 'text/plain') {
         text = await file.text();
         setIsPdf(false);
+        setDocumentText(text);
+        await analyzeDocument(text, null);
       } else if (file.type === 'application/pdf') {
         const blobUrl = URL.createObjectURL(file);
         pdfUrlRef.current = blobUrl;
         setPdfUrl(blobUrl);
         setIsPdf(true);
-        text = await extractTextFromPDF(file);
-        if (!text.trim()) throw new Error('Could not extract text from PDF. The file may be scanned or image-based.');
+
+        const [images, extractedText, formFields] = await Promise.all([
+          renderPDFToImages(file),
+          extractTextFromPDF(file),
+          extractFormFields(file),
+        ]);
+
+        if (!images || images.length === 0) {
+          throw new Error('Could not render PDF pages. The file may be corrupted.');
+        }
+
+        text = extractedText || ' ';
+        setDocumentText(text);
+        await analyzeDocument(text, images, formFields);
       } else {
         throw new Error('Unsupported file type. Please upload a .txt or .pdf file.');
       }
-
-      setDocumentText(text);
-      await analyzeDocument(text);
     } catch (err) {
       setError(`${err.message}`);
     } finally {
@@ -93,12 +174,16 @@ export default function Home() {
     }
   };
 
-  const analyzeDocument = async (text) => {
+  const analyzeDocument = async (text, images = null, formFields = []) => {
     try {
+      const body = { documentText: text };
+      if (images && images.length > 0) body.images = images;
+      if (formFields && formFields.length > 0) body.formFields = formFields;
+
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documentText: text }),
+        body: JSON.stringify(body),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Analysis failed');
@@ -144,7 +229,7 @@ export default function Home() {
     }
   };
 
-  const unfilledCount = extractedData.filter(d => d.value === 'Not filled').length;
+  const unfilledCount = extractedData.filter(d => d.value === 'Not filled' || d.value === 'Not signed').length;
 
   return (
     <div className={styles.root}>
@@ -259,13 +344,15 @@ export default function Home() {
                     key={idx}
                     className={`${styles.tableRow}
                       ${selectedItem?.field === item.field ? styles.activeRow : ''}
-                      ${item.value === 'Not filled' ? styles.unfilledRow : ''}`}
+                      ${(item.value === 'Not filled' || item.value === 'Not signed') ? styles.unfilledRow : ''}`}
                     onClick={() => handleHighlightField(item)}
                   >
                     <div className={`${styles.tableCell} ${styles.fieldCell}`}>{item.field}</div>
                     <div className={styles.tableCell}>
                       {item.value === 'Not filled'
                         ? <span className={styles.unfilledBadge}>Not filled</span>
+                        : item.value === 'Not signed'
+                        ? <span className={styles.unfilledBadge}>Not signed</span>
                         : typeof item.value === 'object' && item.value !== null
                           ? Object.entries(item.value).map(([k, v]) => `${k}: ${v}`).join(', ')
                           : item.value}
