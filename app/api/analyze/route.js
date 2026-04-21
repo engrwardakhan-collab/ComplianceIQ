@@ -1,7 +1,3 @@
-export const config = {
-  api: { bodyParser: { sizeLimit: '50mb' } },
-};
-
 import { OpenAI } from 'openai';
 
 const openai = new OpenAI({
