@@ -80,17 +80,17 @@ async function renderPDFToImages(file) {
   const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
 
   const images = [];
-  const numPages = Math.min(pdf.numPages, 15);
+  const numPages = Math.min(pdf.numPages, 10);
 
   for (let pageNum = 1; pageNum <= numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 3.0 });
+    const viewport = page.getViewport({ scale: 2.5 });
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width;
     canvas.height = viewport.height;
     const ctx = canvas.getContext('2d');
     await page.render({ canvasContext: ctx, viewport }).promise;
-    images.push(canvas.toDataURL('image/jpeg', 0.92));
+    images.push(canvas.toDataURL('image/jpeg', 0.85));
   }
 
   return images;
