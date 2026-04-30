@@ -118,7 +118,11 @@ QUALITY REQUIREMENTS
 ✓ Return only the JSON — no extra text
 `;
 
+export const maxDuration = 60;
+
 export async function POST(request) {
+  const encoder = new TextEncoder();
+
   try {
     const { documentText, images, formFields } = await request.json();
 
@@ -126,10 +130,7 @@ export async function POST(request) {
     const hasText = documentText && documentText.trim();
 
     if (!hasImages && !hasText) {
-      return Response.json(
-        { error: 'No document provided' },
-        { status: 400 }
-      );
+      return Response.json({ error: 'No document provided' }, { status: 400 });
     }
 
     const formFieldsHint = formFields && formFields.length > 0
@@ -149,37 +150,59 @@ export async function POST(request) {
         ]
       : `Analyze this Michigan Realtors® document and extract ALL fields. This could be any form type - Listing Contract, Change Sheet, Buyer Agency, Amendment, etc. Just extract whatever is in the document.\n\n${documentText}${formFieldsHint}`;
 
-    const response = await openai.chat.completions.create({
-      model: 'o3',
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userContent },
-      ],
-      max_completion_tokens: 16000,
+    const stream = new ReadableStream({
+      async start(controller) {
+        // Send keepalive ping every 5s so Vercel doesn't close the connection
+        const keepalive = setInterval(() => {
+          try { controller.enqueue(encoder.encode('data: {"type":"ping"}\n\n')); } catch {}
+        }, 5000);
+
+        try {
+          const aiStream = await openai.chat.completions.create({
+            model: 'o3',
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'user', content: userContent },
+            ],
+            max_completion_tokens: 16000,
+            stream: true,
+          });
+
+          let fullContent = '';
+          for await (const chunk of aiStream) {
+            fullContent += chunk.choices[0]?.delta?.content || '';
+          }
+
+          const jsonMatch = fullContent.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) throw new Error('Could not parse analysis');
+
+          const parsed = JSON.parse(jsonMatch[0]);
+          const result = {
+            type: 'result',
+            success: true,
+            extracted_data: parsed.extracted_data || [],
+            summary: parsed.summary || '',
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(result)}\n\n`));
+        } catch (error) {
+          console.error('Analysis error:', error);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: error.message || 'Analysis failed' })}\n\n`));
+        } finally {
+          clearInterval(keepalive);
+          controller.close();
+        }
+      },
     });
 
-    const content = response.choices[0].message.content;
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-
-    if (!jsonMatch) {
-      return Response.json(
-        { error: 'Could not parse analysis' },
-        { status: 500 }
-      );
-    }
-
-    const parsed = JSON.parse(jsonMatch[0]);
-
-    return Response.json({
-      success: true,
-      extracted_data: parsed.extracted_data || [],
-      summary: parsed.summary || '',
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   } catch (error) {
     console.error('Analysis error:', error);
-    return Response.json(
-      { error: error.message || 'Analysis failed' },
-      { status: 500 }
-    );
+    return Response.json({ error: error.message || 'Analysis failed' }, { status: 500 });
   }
 }

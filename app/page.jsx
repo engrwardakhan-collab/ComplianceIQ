@@ -185,11 +185,37 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Analysis failed');
-      setExtractedData(data.extracted_data || []);
-      setSummary(data.summary || '');
-      setMessages([{ role: 'assistant', content: `I've analyzed your contract and found ${data.extracted_data?.length || 0} key fields. What would you like to know?` }]);
+
+      if (!response.ok) throw new Error('Analysis failed');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === 'ping') continue;
+            if (event.type === 'error') throw new Error(event.error);
+            if (event.type === 'result') {
+              setExtractedData(event.extracted_data || []);
+              setSummary(event.summary || '');
+              setMessages([{ role: 'assistant', content: `I've analyzed your contract and found ${event.extracted_data?.length || 0} key fields. What would you like to know?` }]);
+            }
+          } catch (e) {
+            if (e.message && e.message !== 'Unexpected end of JSON input') throw e;
+          }
+        }
+      }
     } catch (err) {
       setError(`Analysis error: ${err.message}`);
     }
